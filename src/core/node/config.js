@@ -16,6 +16,7 @@ import process from "node:process";
 import { fetch, Headers, Request, Response } from "undici";
 import * as util from "./util.js";
 import * as blocklists from "./blocklists.js";
+import * as dbip from "./dbip.js";
 import Log from "../log.js";
 import * as system from "../../system.js";
 import { services, stopAfter } from "../svc.js";
@@ -27,8 +28,6 @@ import * as swap from "../linux/swap.js";
   system.when("steady").then(up);
 })();
 
-process.on("SIGINT", (sig) => stopAfter());
-
 async function prep() {
   // if this file execs... assume we're on nodejs.
   const isProd = process.env.NODE_ENV === "production";
@@ -36,21 +35,10 @@ async function prep() {
   const profiling = process.env.PROFILE_DNS_RESOLVES === "true";
 
   let devutils = null;
-  let dotenv = null;
 
   // dev utilities
   if (!isProd) {
     devutils = await import("./util-dev.js");
-    // TODO: remove .env
-    dotenv = await import("dotenv");
-  }
-
-  /** Environment Variables */
-  // Load env variables from .env file to process.env (if file exists)
-  // NOTE: this won't overwrite existing
-  if (dotenv) {
-    dotenv.config();
-    console.log("loading local .env");
   }
 
   globalThis.envManager = new EnvManager();
@@ -154,6 +142,18 @@ async function up() {
   } else {
     log.w("Config", "blocklists unavailable / disabled");
   }
+  const lp = services.logPusher;
+  if (lp != null) {
+    try {
+      await dbip.setup(lp);
+    } catch (ex) {
+      log.e("Config", "dbip setup failed", ex);
+    }
+  } else {
+    log.w("Config", "logpusher unavailable");
+  }
+
+  process.on("SIGINT", (sig) => stopAfter());
 
   // signal all system are-a go
   system.pub("go");

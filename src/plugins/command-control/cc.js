@@ -8,6 +8,7 @@
 import * as cfg from "../../core/cfg.js";
 import * as util from "../../commons/util.js";
 import * as rdnsutil from "../rdns-util.js";
+import * as pres from "../plugin-response.js";
 import { flagsToTags, tagsToFlags } from "@serverless-dns/trie/stamp.js";
 import * as token from "../users/auth-token.js";
 import { BlocklistFilter } from "../rethinkdns/filter.js";
@@ -32,24 +33,21 @@ export class CommandControl {
   }
 
   /**
-   * @param {Object} param
-   * @param {Request} param.request
-   * @param {String | Number} param.latestTimestamp
-   * @param {Boolean} param.isDnsMsg
-   * @returns
+   * @param {{rxid: string, request: Request, latestTimestamp: string|number, isDnsMsg: boolean}} ctx
+   * @returns {Promise<pres.RResp>}
    */
-  async RethinkModule(param) {
+  async exec(ctx) {
     // process only GET requests, ignore all others
-    if (util.isGetRequest(param.request)) {
+    if (util.isGetRequest(ctx.request)) {
       return await this.commandOperation(
-        param.rxid,
-        param.request.url,
-        param.isDnsMsg
+        ctx.rxid,
+        ctx.request.url,
+        ctx.isDnsMsg
       );
     }
 
     // no-op
-    return util.emptyResponse();
+    return pres.emptyResponse();
   }
 
   isAnyCmd(s) {
@@ -95,7 +93,7 @@ export class CommandControl {
   }
 
   async commandOperation(rxid, url, isDnsCmd) {
-    let response = util.emptyResponse();
+    let response = pres.emptyResponse();
 
     try {
       const reqUrl = new URL(url);
@@ -166,7 +164,7 @@ export class CommandControl {
       }
     } catch (e) {
       this.log.e(rxid, "err cc:op", e.stack);
-      response = util.errResponse("cc:op", e);
+      response = pres.errResponse("cc:op", e);
       // TODO: set response status to 5xx
       response.data.httpResponse = jsonResponse(e.stack);
     }
@@ -200,8 +198,8 @@ async function generateAccessKey(queryString, hostname) {
   if (util.emptyString(dom)) {
     dom = hostname.split(".").slice(-2).join(".");
   }
-  const acc = await token.gen(msg, dom);
-  return jsonResponse({ accesskey: acc, context: dom });
+  const [_, hexcat] = await token.gen(msg, dom);
+  return jsonResponse({ accesskey: hexcat, context: dom });
 }
 
 /**

@@ -83,12 +83,17 @@ function systemUp() {
   log = util.logger("NodeJs");
   if (!log) throw new Error("logger unavailable on system up");
 
-  const onlydownload = envutil.blocklistDownloadOnly();
+  const downloadmode = envutil.blocklistDownloadOnly();
+  const profilermode = envutil.profileDnsResolves();
   const tlsoffload = envutil.isCleartext();
 
-  if (onlydownload) {
+  if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
     return;
+  } else if (profilermode) {
+    const durationms = 60 * 1000;
+    log.w("in profiler mode, run for", durationms, "and exit");
+    stopAfter(durationms);
   }
 
   if (tlsoffload) {
@@ -143,7 +148,7 @@ function systemUp() {
 
     // DNS over HTTPS
     const doh = http2
-      // serverHTTPS must eventually invoke machines-heartbeat
+      // serveHTTPS must eventually invoke machines-heartbeat
       .createSecureServer({ ...tlsOpts, allowHTTP1: true }, serveHTTPS)
       .listen(portdoh, () => up("DoH", doh.address()));
 
@@ -251,16 +256,22 @@ function serveDoTProxyProto(clientSocket) {
   });
 }
 
-function makeScratchBuffer() {
-  const qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
-  const qlenBufOffset = bufutil.recycleBuffer(qlenBuf);
+class ScratchBuffer {
+  constructor() {
+    /** @type {Buffer} */
+    this.qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
+    /** @type {Number} */
+    this.qlenBufOffset = bufutil.recycleBuffer(qlenBuf);
+    this.qBuf = null;
+    this.qBufOffset = 0;
+  }
 
-  return {
-    qlenBuf: qlenBuf,
-    qlenBufOffset: qlenBufOffset,
-    qBuf: null,
-    qBufOffset: 0,
-  };
+  allocOnce(sz) {
+    if (this.qBuf === null) {
+      this.qBuf = bufutil.createBuffer(sz);
+      this.qBufOffset = bufutil.recycleBuffer(this.qBuf);
+    }
+  }
 }
 
 /**
@@ -363,7 +374,7 @@ function serveTLS(socket) {
   log.d(`(${socket.getProtocol()}), tls reused? ${socket.isSessionReused()}`);
 
   const [flag, host] = isOurWcDn ? getMetadata(sni) : ["", sni];
-  const sb = makeScratchBuffer();
+  const sb = new ScratchBuffer();
 
   log.d("----> DoT request", host, flag);
   socket.on("data", (data) => {
@@ -387,7 +398,7 @@ function serveTCP(socket) {
   // doesn't yet support v2, but only v1. ClientHello would contain
   // the SNI which we could then use here.
   const [flag, host] = ["", "ignored.example.com"];
-  const sb = makeScratchBuffer();
+  const sb = new ScratchBuffer();
 
   machinesHeartbeat();
   log.d("----> DoT Cleartext request", host, flag);
@@ -408,7 +419,7 @@ function serveTCP(socket) {
  * Handle DNS over TCP/TLS data stream.
  * @param {TLSSocket} socket
  * @param {Buffer} chunk - A TCP data segment
- * @param {Object} sb - Scratch buffer
+ * @param {ScratchBuffer} sb - Scratch buffer
  * @param {String} host - Hostname
  * @param {String} flag - Blocklist Flag
  */
@@ -443,10 +454,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
   // chunk out dns-query starting rem-th byte
   const data = chunk.slice(rem);
 
-  if (sb.qBuf === null) {
-    sb.qBuf = bufutil.createBuffer(qlen);
-    sb.qBufOffset = bufutil.recycleBuffer(sb.qBuf);
-  }
+  sb.allocOnce(qlen);
 
   sb.qBuf.fill(data, sb.qBufOffset);
   sb.qBufOffset += size;
@@ -507,6 +515,7 @@ async function handleTCPQuery(q, socket, host, flag) {
 }
 
 /**
+ * @param {String} rxid
  * @param {Buffer} q
  * @param {String} host
  * @param {String} flag
@@ -517,6 +526,8 @@ async function resolveQuery(rxid, q, host, flag) {
   // where-as DNS-over-TCP msgs could be upto 64KB in size.
   const freq = new Request(`https://${host}/${flag}`, {
     method: "POST",
+    // TODO: populate req ip in x-nile-client-ip header
+    // TODO: add host header
     headers: util.concatHeaders(
       util.dnsHeaders(),
       util.contentLengthHeader(q),
@@ -592,6 +603,7 @@ async function handleHTTPRequest(b, req, res) {
       // Note: In VM container, Object spread may not be working for all
       // properties, especially of "hidden" Symbol values!? like "headers"?
       ...req,
+      // TODO: populate req ip in x-nile-client-ip header
       headers: util.concatHeaders(
         util.rxidHeader(rxid),
         nodeutil.copyNonPseudoHeaders(req.headers)

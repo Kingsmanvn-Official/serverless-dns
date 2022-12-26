@@ -1,9 +1,10 @@
-import { config as dotEnvConfig } from "dotenv";
 import * as system from "../../system.js";
 import * as blocklists from "./blocklists.ts";
-import { services } from "../svc.js";
+import * as dbip from "./dbip.ts";
+import { services, stopAfter } from "../svc.js";
 import Log from "../log.js";
 import EnvManager from "../env.js";
+import { signal } from "https://deno.land/std@0.170.0/signal/mod.ts";
 
 // In global scope.
 declare global {
@@ -22,17 +23,16 @@ declare global {
   system.when("steady").then(up);
 })();
 
+async function sigctrl() {
+  const sigs = signal("SIGINT");
+  for await (const _ of sigs) {
+    stopAfter();
+  }
+}
+
 async function prep() {
   // if this file execs... assume we're on deno.
   if (!Deno) throw new Error("failed loading deno-specific config");
-
-  // Load env variables from .env file to Deno.env (if file exists)
-  try {
-    dotEnvConfig({ export: true });
-  } catch (e) {
-    // throws without --allow-read flag
-    console.warn(".env missing => ", e.name, e.message);
-  }
 
   const isProd = Deno.env.get("DENO_ENV") === "production";
   const onDenoDeploy = Deno.env.get("CLOUD_PLATFORM") === "deno-deploy";
@@ -62,7 +62,17 @@ async function up() {
   } else {
     console.warn("Config", "blocklists unavailable / disabled");
   }
-
+  const lp = services.logPusher;
+  if (lp != null) {
+    try {
+      await dbip.setup(lp);
+    } catch (ex) {
+      console.error("Config", "dbip setup failed", ex);
+    }
+  } else {
+    console.warn("Config", "logpusher unavailable");
+  }
+  sigctrl();
   // signal all system are-a go
   system.pub("go");
 }

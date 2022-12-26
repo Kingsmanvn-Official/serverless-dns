@@ -65,19 +65,19 @@ export function hasHttpCache() {
 export function isWorkers() {
   if (!envManager) return false;
 
-  return envManager.get("RUNTIME") === "worker";
+  return envManager.r() === "worker";
 }
 
 export function isNode() {
   if (!envManager) return false;
 
-  return envManager.get("RUNTIME") === "node";
+  return envManager.r() === "node";
 }
 
 export function isDeno() {
   if (!envManager) return false;
 
-  return envManager.get("RUNTIME") === "deno";
+  return envManager.r() === "deno";
 }
 
 export function workersTimeout(missing = 0) {
@@ -127,6 +127,11 @@ export function dohResolvers() {
   }
 
   return [primaryDohResolver()];
+}
+
+export function geoipUrl() {
+  if (!envManager) return null;
+  return envManager.get("GEOIP_URL");
 }
 
 export function tlsCrtPath() {
@@ -206,10 +211,10 @@ export function profileDnsResolves() {
   return envManager.get("PROFILE_DNS_RESOLVES") || false;
 }
 
-export function accessKey() {
+export function accessKeys() {
   if (!envManager) return "";
 
-  return envManager.get("ACCESS_KEY") || "";
+  return envManager.get("ACCESS_KEYS") || null;
 }
 
 export function forceDoh() {
@@ -257,6 +262,16 @@ export function recursive() {
   return onFly();
 }
 
+// returns a set of subdomains on which logpush is enabled
+export function logpushSources() {
+  if (!envManager) return null;
+
+  const csv = envManager.get("LOGPUSH_SRC") || null;
+  if (onCloudflare() || onLocal()) return csv;
+
+  return null;
+}
+
 export function gwip4() {
   return envManager.get("GW_IP4") || "";
 }
@@ -267,4 +282,20 @@ export function gwip6() {
 
 export function region() {
   return envManager.get("FLY_REGION") || "";
+}
+
+export function metrics() {
+  const nobinding = [null, null];
+
+  if (!envManager) return nobinding;
+
+  // match the binding names as in wrangler.toml
+  if (onCloudflare()) {
+    return [
+      envManager.get("METRICS") || null,
+      envManager.get("BL_METRICS") || null,
+    ];
+  }
+
+  return nobinding;
 }

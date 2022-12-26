@@ -10,10 +10,16 @@ import * as util from "../commons/util.js";
 import * as bufutil from "../commons/bufutil.js";
 import * as dnsutil from "../commons/dnsutil.js";
 import * as envutil from "../commons/envutil.js";
+import * as pres from "./plugin-response.js";
+import * as trie from "@serverless-dns/trie/stamp.js";
 
 // doh uses b64url encoded blockstamp, while dot uses lowercase b32.
 const _b64delim = ":";
 const _b32delim = "-";
+// begins with l, followed by b64delim or b32delim
+export const logPrefix = new RegExp(`^l${_b64delim}|^l${_b32delim}`);
+// begins with a digit, followed by b64delim or b32delim
+export const stampPrefix = new RegExp(`^\\d+${_b64delim}|^\\d+${_b32delim}`);
 
 // TODO: wildcard list should be fetched from S3/KV
 const _wildcardUint16 = new Uint16Array([
@@ -24,57 +30,12 @@ export function isBlocklistFilterSetup(blf) {
   return blf && !util.emptyObj(blf.ftrie);
 }
 
-export function dnsResponse(packet = null, raw = null, stamps = null) {
-  if (util.emptyObj(packet) || bufutil.emptyBuf(raw)) {
-    throw new Error("empty packet for dns-res");
-  }
-  return {
-    isBlocked: false,
-    flag: "",
-    dnsPacket: packet,
-    dnsBuffer: raw,
-    stamps: stamps || {},
-  };
+export function isStampQuery(p) {
+  return stampPrefix.test(p);
 }
 
-export function copyOnlyBlockProperties(to, from) {
-  to.isBlocked = from.isBlocked;
-  to.flag = from.flag;
-
-  return to;
-}
-
-export function rdnsNoBlockResponse(
-  flag = "",
-  packet = null,
-  raw = null,
-  stamps = null
-) {
-  return {
-    isBlocked: false,
-    flag: flag || "",
-    dnsPacket: packet,
-    dnsBuffer: raw,
-    stamps: stamps || {},
-  };
-}
-
-export function rdnsBlockResponse(
-  flag,
-  packet = null,
-  raw = null,
-  stamps = null
-) {
-  if (util.emptyString(flag)) {
-    throw new Error("no flag set for block-res");
-  }
-  return {
-    isBlocked: true,
-    flag: flag,
-    dnsPacket: packet,
-    dnsBuffer: raw,
-    stamps: stamps || {},
-  };
+export function isLogQuery(p) {
+  return logPrefix.test(p);
 }
 
 // dn         -> domain name, ex: you.and.i.example.com
@@ -86,7 +47,7 @@ export function rdnsBlockResponse(
 export function doBlock(dn, userBlInfo, dnBlInfo) {
   const blockSubdomains = envutil.blockSubdomains();
   const version = userBlInfo.flagVersion;
-  const noblock = rdnsNoBlockResponse();
+  const noblock = pres.rdnsNoBlockResponse();
   if (
     util.emptyString(dn) ||
     util.emptyObj(dnBlInfo) ||
@@ -177,7 +138,7 @@ function applyWildcardBlocklists(uint1, flagVersion, dnBlInfo, dn) {
     }
   } while (dnSplit.shift() != null);
 
-  return rdnsNoBlockResponse();
+  return pres.rdnsNoBlockResponse();
 }
 
 function applyBlocklists(uint1, uint2, flagVersion) {
@@ -186,10 +147,10 @@ function applyBlocklists(uint1, uint2, flagVersion) {
 
   if (blockedUint) {
     // incoming user-blockstamp intersects with domain-blockstamp
-    return rdnsBlockResponse(getB64Flag(blockedUint, flagVersion));
+    return pres.rdnsBlockResponse(getB64Flag(blockedUint, flagVersion));
   } else {
     // domain-blockstamp exists but no intersection with user-blockstamp
-    return rdnsNoBlockResponse(getB64Flag(uint2, flagVersion));
+    return pres.rdnsNoBlockResponse(getB64Flag(uint2, flagVersion));
   }
 }
 
@@ -318,11 +279,15 @@ export function extractStamps(u) {
   if (isFreeBraveDns) {
     // oisd, 1hosts:mini, cpbl:light, stevenblack, anudeep, yhosts, tiuxo
     s = "1:YAYBACABEHAgAA==";
-  } else if (util.isDnsQuery(paths[1]) || util.isGatewayQuery(paths[1])) {
-    // skip to next if path has `/dns-query` or `/gateway`
-    s = paths[2] || emptystr;
-  } else {
-    s = paths[1] || emptystr;
+  }
+
+  for (const p of paths) {
+    if (p.length === 0) continue;
+    // skip to next if path has `/dns-query` or `/gateway` or '/l:'
+    if (isStampQuery(p)) {
+      s = p;
+      break;
+    }
   }
 
   // get blockstamp with access-key from paths[1|2]
@@ -359,6 +324,7 @@ export function splitBlockstamp(s) {
   let out = ["", "", "", ""];
 
   if (util.emptyString(s)) return out;
+  if (!isStampQuery(s)) return out;
 
   if (isB32Stamp(s)) {
     out = [_b32delim, ...s.split(_b32delim)];
@@ -450,4 +416,15 @@ export function bareTimestampFrom(tstamp) {
     return 0;
   }
   return t;
+}
+
+export function blocklists(strflag) {
+  const { userBlocklistFlagUint, flagVersion } = unstamp(strflag);
+  const blocklists = [];
+  if (flagVersion === "1") {
+    return trie.flagsToTags(userBlocklistFlagUint);
+  } else {
+    throw new Error("unknown blocklist version: " + flagVersion);
+  }
+  return blocklists;
 }
