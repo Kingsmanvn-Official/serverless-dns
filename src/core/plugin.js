@@ -76,7 +76,7 @@ export default class RethinkPlugin {
     this.registerPlugin(
       "commandControl",
       services.commandControl,
-      ["rxid", "request", "isDnsMsg"],
+      ["rxid", "userAuth", "lid", "request", "isDnsMsg"],
       this.commandControlCallback
     );
 
@@ -199,12 +199,15 @@ export default class RethinkPlugin {
       this.log.w(rxid, "unexpected err userOp", r);
       this.loadException(rxid, response, io);
     } else if (!util.emptyObj(r)) {
+      // will only be null in case of errors
+      const a = r.userAuth;
       // r.userBlocklistInfo and r.dnsResolverUrl may be "null"
       const bi = r.userBlocklistInfo;
       const rr = r.dnsResolverUrl;
       // may be empty string; usually of form "v:base64" or "v-base32"
       const bs = r.userBlocklistFlag;
-      this.log.d(rxid, "set user:blockInfo/resolver/stamp", bi, rr, bs);
+      this.log.d(rxid, "set user:auth/blockInfo/resolver/stamp", a, bi, rr, bs);
+      this.addCtx("userAuth", a);
       this.addCtx("userBlocklistInfo", bi);
       this.addCtx("userBlockstamp", bs);
       this.addCtx("userDnsResolverUrl", rr);
@@ -379,7 +382,8 @@ function makectx(context, ctxkeys) {
 
 // TODO: fetch lid from config store
 function extractLid(url) {
-  return util.fromPath(url, rdnsutil.logPrefix);
+  // if lid is not present in url, then return hostname delimited by "_"
+  return util.fromPath(url, rdnsutil.logPrefix) || util.tld(url, 0, "_");
 }
 
 async function extractDnsQuestion(request) {

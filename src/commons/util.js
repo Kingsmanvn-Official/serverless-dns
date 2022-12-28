@@ -388,6 +388,14 @@ export function respond400() {
   });
 }
 
+export function respond401() {
+  return new Response(null, {
+    status: 401,
+    statusText: "Authorization Required",
+    headers: dohHeaders(),
+  });
+}
+
 export function respond405() {
   return new Response(null, {
     status: 405,
@@ -486,12 +494,38 @@ export function maybeIP(str) {
   return maybeIP4(str) || maybeIP6(str);
 }
 
-export function tld(urlstr) {
+export function* domains(urlOrHost) {
+  if (emptyString(urlOrHost)) return "";
+
+  let hostname = urlOrHost;
+  if (urlOrHost.indexOf(":") > -1 || urlOrHost.indexOf("/") > -1) {
+    const u = new URL(urlOrHost);
+    hostname = u.hostname;
+  }
+
+  const d = hostname.split(".");
+  for (let i = 0; i < d.length; i++) {
+    yield d.slice(i).join(".");
+  }
+}
+
+export function tld(urlstr, upto = 2, d = ".") {
   if (emptyString(urlstr)) return "";
+
   const u = new URL(urlstr);
   // todo: fails for domains like "gov.uk", "co.in" etc
   // see: publicsuffix.org/list/public_suffix_list.dat
-  return u.hostname.split(".").slice(-2).join(".");
+  return u.hostname.split(".").slice(-upto).join(d);
+}
+
+export function bounds(n, min, max) {
+  if (min > max) {
+    max = min;
+    min = max;
+  }
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
 }
 
 export function mkFetchEvent(r, ...fns) {

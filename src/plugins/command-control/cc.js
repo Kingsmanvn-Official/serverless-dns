@@ -12,14 +12,17 @@ import * as pres from "../plugin-response.js";
 import { flagsToTags, tagsToFlags } from "@serverless-dns/trie/stamp.js";
 import * as token from "../users/auth-token.js";
 import { BlocklistFilter } from "../rethinkdns/filter.js";
+import { LogPusher } from "../observability/log-pusher.js";
 import { BlocklistWrapper } from "../rethinkdns/main.js";
 
 export class CommandControl {
-  constructor(blocklistWrapper) {
+  constructor(blocklistWrapper, logPusher) {
     this.latestTimestamp = rdnsutil.bareTimestampFrom(cfg.timestamp());
     this.log = log.withTags("CommandControl");
     /** @type {BlocklistWrapper} */
     this.bw = blocklistWrapper;
+    /** @type {LogPusher} */
+    this.lp = logPusher;
     this.cmds = new Set([
       "configure",
       "config",
@@ -29,11 +32,12 @@ export class CommandControl {
       "listtob64",
       "b64tolist",
       "genaccesskey",
+      "analytics",
     ]);
   }
 
   /**
-   * @param {{rxid: string, request: Request, latestTimestamp: string|number, isDnsMsg: boolean}} ctx
+   * @param {{rxid: string, request: Request, lid: string, userAuth: token.Outcome, isDnsMsg: boolean}} ctx
    * @returns {Promise<pres.RResp>}
    */
   async exec(ctx) {
@@ -42,7 +46,9 @@ export class CommandControl {
       return await this.commandOperation(
         ctx.rxid,
         ctx.request.url,
-        ctx.isDnsMsg
+        ctx.isDnsMsg,
+        ctx.userAuth,
+        ctx.lid
       );
     }
 
@@ -55,44 +61,30 @@ export class CommandControl {
   }
 
   userCommands(url) {
-    const emptyCmd = ["", ""];
     // r.x/a/b/c/ => ["", "a", "b", "c", ""]
     // abc.r.x/a => ["", "a"]
-    const p = url.pathname.split("/");
+    const p = url.pathname.split("/").filter((s) => !util.emptyString(s));
 
-    if (!p || p.length <= 1) return emptyCmd;
+    if (!p || p.length <= 0) return [];
 
-    const last = p[p.length - 1];
-    const first = p[1]; // may equal last
-
-    return [first, last];
+    return p;
   }
 
   userFlag(url, isDnsCmd = false) {
-    const emptyFlag = "";
-    const p = url.pathname.split("/"); // ex: max.rethinkdns.com/cmd/XYZ
-    const d = url.host.split("."); // ex: XYZ.max.rethinkdns.com
-
-    // if cmd is at p[1], blockstamp (userFlag) must be at p[2]
-    if (this.isAnyCmd(p[1])) {
-      return p.length >= 3 ? p[2] : emptyFlag;
-    }
-
-    // Redirect to the configure webpage when _no commands_ are set.
-    // This happens when user clicks, say XYZ.max.rethinkdns.com or
-    // max.rethinkdns.com/XYZ and it opens in a browser.
-
     // When incoming request is a dns-msg, all cmds are no-op
     if (isDnsCmd) return emptyFlag;
 
-    // has path, possibly doh
-    if (p[1]) return p[1]; // ex: max.rethinkdns.com/XYZ
-
-    // no path, possibly dot
-    return d.length > 1 ? d[0] : emptyFlag; // ex: XYZ.max.rethinkdns.com
+    return rdnsutil.blockstampFromUrl(url);
   }
 
-  async commandOperation(rxid, url, isDnsCmd) {
+  /**
+   * @param {string} rxid
+   * @param {Request} request
+   * @param {boolean} isDnsCmd
+   * @param {token.Outcome} auth
+   * @param {string} lid
+   */
+  async commandOperation(rxid, url, isDnsCmd, auth, lid) {
     let response = pres.emptyResponse();
 
     try {
@@ -109,12 +101,18 @@ export class CommandControl {
         response.data.stopProcessing = true;
       }
 
-      const [cmd1, cmd2] = this.userCommands(reqUrl, isDnsCmd);
-      const b64UserFlag = this.userFlag(reqUrl, isDnsCmd);
+      const cmds = this.userCommands(reqUrl, isDnsCmd);
+      const b64UserFlag = this.userFlag(url, isDnsCmd);
       // if userflag is same as cmd1, then cmd2 must be the actual cmd
       // consider urls: r.tld/cmd/flag & r.tld/flag/cmd
       // by default, treat cmd1 (at path[1]) as cmd, regardless
-      const command = this.isAnyCmd(cmd2) ? cmd2 : cmd1;
+      let command = cmds[0];
+      for (const c of cmds) {
+        if (this.isAnyCmd(c)) {
+          command = c;
+          break;
+        }
+      }
 
       this.log.d(rxid, url, "processing... cmd/flag", command, b64UserFlag);
 
@@ -146,9 +144,17 @@ export class CommandControl {
         response.data.httpResponse = searchRedirect(b64UserFlag);
       } else if (command === "genaccesskey") {
         // generate a token
-        response.data.httpResponse = generateAccessKey(
+        response.data.httpResponse = await generateAccessKey(
           queryString,
           reqUrl.hostname
+        );
+      } else if (command === "analytics") {
+        // redirect to the analytics page
+        response.data.httpResponse = await analytics(
+          this.lp,
+          reqUrl,
+          auth,
+          lid
         );
       } else if (command === "config" || command === "configure" || !isDnsCmd) {
         // redirect to configure page
@@ -183,6 +189,9 @@ function searchRedirect(b64userflag) {
   return Response.redirect(u + q, 302);
 }
 
+// Redirect to the configure webpage when _no commands_ are set.
+// This happens when user clicks, say XYZ.max.rethinkdns.com or
+// max.rethinkdns.com/XYZ and it opens in a browser.
 function configRedirect(userFlag, origin, timestamp, highlight) {
   const u = "https://rethinkdns.com/configure";
   let q = "?tstamp=" + timestamp;
@@ -194,12 +203,39 @@ function configRedirect(userFlag, origin, timestamp, highlight) {
 
 async function generateAccessKey(queryString, hostname) {
   const msg = queryString.get("key");
-  let dom = queryString.get("dom");
-  if (util.emptyString(dom)) {
-    dom = hostname.split(".").slice(-2).join(".");
+  const dom = queryString.get("dom");
+  if (!util.emptyString(dom)) {
+    hostname = dom;
   }
-  const [_, hexcat] = await token.gen(msg, dom);
-  return jsonResponse({ accesskey: hexcat, context: token.info });
+  const toks = [];
+  for (const d of util.domains(hostname)) {
+    if (util.emptyString(d)) continue;
+
+    const [_, hexcat] = await token.gen(msg, d);
+    toks.push(hexcat);
+  }
+
+  return jsonResponse({ accesskey: toks, context: token.info });
+}
+
+/**
+ * @param {LogPusher} lp
+ * @param {URL} reqUrl
+ * @param {token.Outcome} auth
+ * @param {string} lid
+ */
+async function analytics(lp, reqUrl, auth, lid) {
+  if (util.emptyString(lid)) {
+    return util.respond401();
+  }
+  if (auth.no) {
+    return util.respond401();
+  }
+  const p = reqUrl.searchParams;
+  const t = p.get("t");
+  const f = p.getAll("f");
+  const r = await lp.count1(lid, t, f);
+  return jsonResponse(r);
 }
 
 /**
