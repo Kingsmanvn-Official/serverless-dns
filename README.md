@@ -1,6 +1,6 @@
 #### It's a bird, it's a plane, it's... a self-hosted, pi-hole esque, DNS resolver
 
-_serverless-dns_ is a Pi-Hole esque [content-blocking](https://github.com/serverless-dns/blocklists), serverless, stub DNS-over-HTTPS (DoH) and DNS-over-TLS (DoT) resolver. Runs out-of-the-box on [Cloudflare Workers](https://workers.dev), [Deno Deploy](https://deno.com/deploy), and [Fly.io](https://fly.io/). Free tiers of all these services should be enough to cover 10 to 20 devices worth of DNS traffic per month.
+_serverless-dns_ is a Pi-Hole esque [content-blocking](https://github.com/serverless-dns/blocklists), serverless, stub DNS-over-HTTPS (DoH) and DNS-over-TLS (DoT) resolver. Runs out-of-the-box on [Cloudflare Workers](https://workers.dev), [Deno Deploy](https://deno.com/deploy), [Fastly Compute@Edge](https://www.fastly.com/products/edge-compute), and [Fly.io](https://fly.io/). Free tiers of all these services should be enough to cover 10 to 20 devices worth of DNS traffic per month.
 
 ### The RethinkDNS resolver
 
@@ -8,8 +8,9 @@ RethinkDNS runs `serverless-dns` in production at these endpoints:
 
 | Cloud platform     | Server locations | Protocol    | Domain                    | Usage                                   |
 |--------------------|------------------|-------------|---------------------------|-----------------------------------------|
-| ⛅ Cloudflare Workers | 200+ ([ping](https://check-host.net/check-ping?host=https://sky.rethinkdns.com))        | DoH         | `sky.rethinkdns.com`    | [configure](https://rethinkdns.com/configure?p=doh)  |
-| 🦕 Deno Deploy        | 30+ ([ping](https://check-host.net/check-ping?host=https://deno.dev))                     | DoH         | _private beta_            |                                         |
+| ⛅ Cloudflare Workers | 200+ ([ping](https://check-host.net/check-ping?host=https://sky.rethinkdns.com))           | DoH         | `sky.rethinkdns.com`    | [configure](https://rethinkdns.com/configure?p=doh)  |
+| 🦕 Deno Deploy        | 30+ ([ping](https://check-host.net/check-ping?host=https://deno.dev))                      | DoH         | _private beta_          |                                         |
+| Fastly Compute@Edge   | 80+ ([ping](https://check-host.net/check-ping?host=https://serverless-dns.edgecompute.app))| DoH         | _private beta_          | [configure](https://rethinkdns.com/configure?p=doh) |
 | 🪂 Fly.io             | 30+ ([ping](https://check-host.net/check-ping?host=https://max.rethinkdns.com))           | DoH and DoT | `max.rethinkdns.com`      | [configure](https://rethinkdns.com/configure?p=dot)  |
 
 Server-side processing takes from 0 milliseconds (ms) to 2ms (median), and end-to-end latency (varies across regions and networks) is between 10ms to 30ms (median).
@@ -20,11 +21,14 @@ Cloudflare Workers is the easiest platform to setup `serverless-dns`:
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/serverless-dns/serverless-dns)
 
+[![Deploy to Fastly](https://deploy.edgecompute.app/button)](https://deploy.edgecompute.app/deploy)
+
 For step-by-step instructions, refer:
 
 | Platform       | Difficulty | Runtime                                | Doc                                                                                     |
 | ---------------| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
 | ⛅ Cloudflare  | Easy       | [v8](https://v8.dev) _Isolates_        | [Hosting on Cloudflare Workers](https://docs.rethinkdns.com/dns/open-source#cloudflare) |
+| Fastly Compute@Edge | Easy  | [Fastly JS](https://js-compute-reference-docs.edgecompute.app/)| [Hosting on Fastly Compute@Edge](https://docs.rethinkdns.com/dns/open-source#fastly) |
 | 🦕 Deno.com    | Moderate   | [Deno](https://deno.land) _Isolates_   | [Hosting on Deno.com](https://docs.rethinkdns.com/dns/open-source#deno-deploy)          |
 | 🪂 Fly.io      | Hard       | [Node](https://nodejs.org) _MicroVM_   | [Hosting on Fly.io](https://docs.rethinkdns.com/dns/open-source#fly-io)                 |
 
@@ -80,6 +84,15 @@ curl -fsSL https://deno.land/install.sh | sh
 ./run d
 ```
 
+Fastly:
+```bash
+# install Fastly CLI 
+# https://developer.fastly.com/learning/tools/cli
+
+# run serverless-dns on Fastly Compute@Edge
+./run f
+```
+
 Wrangler:
 ```bash
 # install Cloudflare Workers (cli) aka Wrangler
@@ -107,6 +120,7 @@ Pull requests are also checked for code style violations and fixed automatically
 
 Configure [`env.js`](src/core/env.js) if you need to tweak the defaults.
 For Cloudflare Workers, setup env vars in [`wrangler.toml`](wrangler.toml), instead.
+For Fastly Compute@Edge, setup env vars in [`fastly.toml`](fastly.toml), instead.
 
 #### Request flow
 
@@ -213,8 +227,8 @@ in-process lfu caches. To disable caching altogether on all three platfroms, set
 
 #### Cloud
 
-Cloudflare Workers and Deno Deploy are ephemeral, as in, the "process" that serves client requests is not long-lived,
-and in fact, two back-to-back requests may be served by two different [_isolates_](https://developers.cloudflare.com/workers/learning/how-workers-works) ("processes"). Resolver on Fly.io, running Node, is backed by [persistent VMs](https://fly.io/blog/docker-without-docker/) and is hence longer-lived,
+Cloudflare Workers, and Deno Deploy are ephemeral, as in, the "process" that serves client requests is not long-lived,
+and in fact, two back-to-back requests may be served by two different [_isolates_](https://developers.cloudflare.com/workers/learning/how-workers-works) ("processes"). Fastly Compute@Edge is the also ephemeral but does not use isolates, instead Fastly creates and destroys a [wasmtime](https://wasmtime.dev/) sandbox for each request. Resolver on Fly.io, running Node, is backed by [persistent VMs](https://fly.io/blog/docker-without-docker/) and is hence longer-lived,
 like traditional "serverfull" environments.
 
 For Deno Deploy, the code-base is bundled up in a single javascript file with `deno bundle` and then handed off
@@ -222,6 +236,9 @@ to Deno.com.
 
 Cloudflare Workers build-time and runtime configurations are defined in [`wrangler.toml`](wrangler.toml).
 [Webpack5 bundles the files](webpack.config.cjs) in an ESM module which is then uploaded to Cloudflare by _Wrangler_.
+
+Fastly Compute@Edge build-time and runtime configurations are defined in [`fastly.toml`](fastly.toml).
+[Webpack5 bundles the files](webpack.fastly.cjs) in an ESM module which is then uploaded to Fastly by the _Fastly CLI_.
 
 For Fly.io, which runs Node, the runtime directives are defined in [`fly.toml`](fly.toml) (used by `dev` and `live` deployment-types),
 while deploy directives are in [`node.Dockerfile`](node.Dockerfile). [`flyctl`](https://fly.io/docs/flyctl) accordingly sets
@@ -232,6 +249,9 @@ up `serverless-dns` on Fly.io's infrastructure.
 npm run build
 # usually, env-name is prod
 npx wrangler publish [-e <env-name>]
+
+# build and deploy for Fastly Compute@Edge
+fastly compute publish
 
 # build and deploy to fly.io
 npm run build:fly
