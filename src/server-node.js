@@ -261,7 +261,7 @@ class ScratchBuffer {
     /** @type {Buffer} */
     this.qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
     /** @type {Number} */
-    this.qlenBufOffset = bufutil.recycleBuffer(qlenBuf);
+    this.qlenBufOffset = bufutil.recycleBuffer(this.qlenBuf);
     this.qBuf = null;
     this.qBufOffset = 0;
   }
@@ -519,7 +519,7 @@ async function handleTCPQuery(q, socket, host, flag) {
  * @param {Buffer} q
  * @param {String} host
  * @param {String} flag
- * @return {Promise<Uint8Array>}
+ * @return {Promise<Uint8Array?>}
  */
 async function resolveQuery(rxid, q, host, flag) {
   // Using POST, since GET requests cannot be greater than 2KB,
@@ -541,7 +541,7 @@ async function resolveQuery(rxid, q, host, flag) {
   const ans = await r.arrayBuffer();
 
   if (!bufutil.emptyBuf(ans)) {
-    return new Uint8Array(ans);
+    return bufutil.normalize8(ans);
   } else {
     log.w(rxid, host, "empty ans, send servfail; flags?", flag);
     return dnsutil.servfailQ(q);
@@ -629,14 +629,14 @@ async function handleHTTPRequest(b, req, res) {
     log.lapTime(t, "recv-ans");
 
     if (!bufutil.emptyBuf(ans)) {
-      res.end(bufutil.bufferOf(ans));
+      res.end(bufutil.normalize8(ans));
     } else {
       // expect fRes.status to be set to non 2xx above
       res.end();
     }
   } catch (e) {
-    res.writeHead(400); // bad request
-    res.end();
+    if (!res.headersSent) res.writeHead(400); // bad request
+    if (!res.writableEnded) res.end();
     log.w(e);
   }
 

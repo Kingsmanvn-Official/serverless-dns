@@ -10,7 +10,7 @@ RethinkDNS runs `serverless-dns` in production at these endpoints:
 |--------------------|------------------|-------------|---------------------------|-----------------------------------------|
 | ⛅ Cloudflare Workers | 200+ ([ping](https://check-host.net/check-ping?host=https://sky.rethinkdns.com))           | DoH         | `sky.rethinkdns.com`    | [configure](https://rethinkdns.com/configure?p=doh)  |
 | 🦕 Deno Deploy        | 30+ ([ping](https://check-host.net/check-ping?host=https://deno.dev))                      | DoH         | _private beta_          |                                         |
-| 🕐 Fastly Compute@Edge   | 80+ ([ping](https://check-host.net/check-ping?host=https://serverless-dns.edgecompute.app))| DoH         | _private beta_          | [configure](https://rethinkdns.com/configure?p=doh) |
+| ⏱️ Fastly Compute@Edge   | 80+ ([ping](https://check-host.net/check-ping?host=https://serverless-dns.edgecompute.app))| DoH         | _private beta_          |                                      |
 | 🪂 Fly.io             | 30+ ([ping](https://check-host.net/check-ping?host=https://max.rethinkdns.com))           | DoH and DoT | `max.rethinkdns.com`      | [configure](https://rethinkdns.com/configure?p=dot)  |
 
 Server-side processing takes from 0 milliseconds (ms) to 2ms (median), and end-to-end latency (varies across regions and networks) is between 10ms to 30ms (median).
@@ -28,8 +28,8 @@ For step-by-step instructions, refer:
 | Platform       | Difficulty | Runtime                                | Doc                                                                                     |
 | ---------------| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
 | ⛅ Cloudflare  | Easy       | [v8](https://v8.dev) _Isolates_        | [Hosting on Cloudflare Workers](https://docs.rethinkdns.com/dns/open-source#cloudflare) |
-| ⏱️ Fastly Compute@Edge | Easy  | [Fastly JS](https://js-compute-reference-docs.edgecompute.app/)| [Hosting on Fastly Compute@Edge](https://docs.rethinkdns.com/dns/open-source#fastly) |
 | 🦕 Deno.com    | Moderate   | [Deno](https://deno.land) _Isolates_   | [Hosting on Deno.com](https://docs.rethinkdns.com/dns/open-source#deno-deploy)          |
+| ⏱️ Fastly Compute@Edge | Easy  | [Fastly JS](https://js-compute-reference-docs.edgecompute.app/)| [Hosting on Fastly Compute@Edge](https://docs.rethinkdns.com/dns/open-source#fastly) |
 | 🪂 Fly.io      | Hard       | [Node](https://nodejs.org) _MicroVM_   | [Hosting on Fly.io](https://docs.rethinkdns.com/dns/open-source#fly-io)                 |
 
 To setup blocklists, visit `https://<my-domain>.tld/configure` from your browser (it should load something similar to [RethinkDNS' _configure_ page](https://rethinkdns.com/configure)).
@@ -56,7 +56,7 @@ cd ./serverless-dns
 
 Node:
 ```bash
-# install node v16+ via nvm, if required
+# install node v19+ via nvm, if required
 # https://github.com/nvm-sh/nvm#installing-and-updating
 wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash
 nvm install --lts
@@ -76,7 +76,7 @@ npm update
 
 Deno:
 ```bash
-# install deno.land v1.18+
+# install deno.land v1.22+
 # https://github.com/denoland/deno/#install
 curl -fsSL https://deno.land/install.sh | sh
 
@@ -86,7 +86,8 @@ curl -fsSL https://deno.land/install.sh | sh
 
 Fastly:
 ```bash
-# install Fastly CLI 
+# install node v18+ via nvm, if required
+# install the Fastly CLI
 # https://developer.fastly.com/learning/tools/cli
 
 # run serverless-dns on Fastly Compute@Edge
@@ -201,7 +202,7 @@ On Node, the default DNS upstream is `1.1.1.2` ([ref](https://github.com/serverl
 
 The entrypoints for Node and Deno are [`src/server-node.js`](src/server-node.js), [`src/server-deno.ts`](src/server-deno.ts) respectively,
 and both listen for TCP-over-TLS, HTTP/S connections; whereas, the entrypoint for Cloudflare Workers, which only listens over HTTP (cli) or
-over HTTP/S (prod), is [`src/server-workers.js`](src/server-workers.js).
+over HTTP/S (prod), is [`src/server-workers.js`](src/server-workers.js); and for Fastly its [`src/server-fastly.js`](src/server-fastly.js).
 
 Local (non-prod) setups on Node, `key` (private) and `cert` (public chain) files, by default, are read from
 paths defined in env vars, `TLS_KEY_PATH` and `TLS_CRT_PATH`.
@@ -238,7 +239,8 @@ Cloudflare Workers build-time and runtime configurations are defined in [`wrangl
 [Webpack5 bundles the files](webpack.config.cjs) in an ESM module which is then uploaded to Cloudflare by _Wrangler_.
 
 Fastly Compute@Edge build-time and runtime configurations are defined in [`fastly.toml`](fastly.toml).
-[Webpack5 bundles the files](webpack.fastly.cjs) in an ESM module which is then uploaded to Fastly by the _Fastly CLI_.
+[Webpack5 bundles the files](webpack.fastly.cjs) in an ESM module which is then compiled to WASM by `npx js-compute-runtime`
+and subsequently packaged and published to Fastly Compute@Edge with the _Fastly CLI_.
 
 For Fly.io, which runs Node, the runtime directives are defined in [`fly.toml`](fly.toml) (used by `dev` and `live` deployment-types),
 while deploy directives are in [`node.Dockerfile`](node.Dockerfile). [`flyctl`](https://fly.io/docs/flyctl) accordingly sets
@@ -250,7 +252,8 @@ npm run build
 # usually, env-name is prod
 npx wrangler publish [-e <env-name>]
 
-# build and deploy for Fastly Compute@Edge
+# bundle, build, and deploy for fastly compute@edge
+# developer.fastly.com/reference/cli/compute/publish
 fastly compute publish
 
 # build and deploy to fly.io
@@ -274,4 +277,4 @@ if possible [see](https://github.com/serverless-dns/blocklists/issues/19)), and 
 required to setup the radix-trie during runtime bring-up or, downloads them [lazily](https://github.com/serverless-dns/serverless-dns/blob/02f9e5bf/src/plugins/dns-op/resolver.js#L167),
 when serving a DNS request.
 
-`serverless-dns` compiles around ~11M entries (as of Nov 2022) from around 190+ blocklists. These are defined in the [serverless-dns/blocklists](https://github.com/serverless-dns/blocklists) repository.
+`serverless-dns` compiles around ~13M entries (as of Jan 2023) from around 190+ blocklists. These are defined in the [serverless-dns/blocklists](https://github.com/serverless-dns/blocklists) repository.

@@ -9,6 +9,7 @@
 import * as util from "../../commons/util.js";
 import * as dnsutil from "../../commons/dnsutil.js";
 import * as envutil from "../../commons/envutil.js";
+import * as txs from "../../commons/lf-transformer.js";
 import * as pres from "../plugin-response.js";
 import * as rdnsutil from "../rdns-util.js";
 import { GeoIP } from "./geoip.js";
@@ -40,6 +41,14 @@ const maxmins = 365 * 24 * 60;
 const minlimit = 1;
 // max number of rows per query
 const maxlimit = 100;
+
+// stream process logpush logs as text?
+const processLogsAsText = false;
+
+// note: no way to retrieve dataset names from the wa bindings
+// datasets for worker analytics
+const ONE_WA_DATASET1 = "ONE_M0";
+const ONE_WA_DATASET2 = "ONE_BL0";
 
 /**
  * There's no way to enable Logpush on just one Worker env or choose different
@@ -74,6 +83,7 @@ export class LogPusher {
     this.cols1 = this.setupCols1();
     /** @type URL | null */
     this.meturl = this.setupMetUrl();
+    this.remotelogurl = this.setupLogpushUrl();
     /** @type String */
     this.apitoken = envutil.cfApiToken();
 
@@ -167,7 +177,7 @@ export class LogPusher {
       this.remotelog(lk + logdelim + l);
     }
 
-    bg(this.rec(lk, all));
+    bg(this.rec(lid, all));
 
     this.corelog.d(`remotelog lines: ${lk} ${lines.length}`);
   }
@@ -299,7 +309,7 @@ export class LogPusher {
   }
 
   // all => [version, ip, region, host, up, qname, qtype, ans, f]
-  async rec(lk, all) {
+  async rec(lid, all) {
     const [m1, m2] = this.metricsservice();
     if (m1 == null || m2 == null) return;
 
@@ -316,8 +326,9 @@ export class LogPusher {
     // todo: device-id, should it be concatenated with log-key?
     // todo: faang dominance (sigma?)
 
-    const idx1 = this.idxmet(lk, "1");
-    const idx2 = this.idxmet(lk, "2");
+    // lk is simply "logkey" and not "k:logkey"
+    const idx1 = this.idxmet(lid, "1");
+    const idx2 = this.idxmet(lid, "2");
 
     // metric blobs in m1 should never change order; add new blobs at the end
     // update this.setupCols1() when appending new blobs / doubles
@@ -343,7 +354,6 @@ export class LogPusher {
       metrics2.push(this.nummet(blists.length)); // blocklists count
     }
 
-    this.corelog.d(`rec: ${lk} ${metrics1.length} ${metrics2.length}`);
     const blobs1 = metrics1.filter((m) => m.blob != null);
     const blobs2 = metrics2.filter((m) => m.blob != null);
     const doubles1 = metrics1.filter((m) => m.double != null);
@@ -365,6 +375,7 @@ export class LogPusher {
         indexes: [idx2],
       });
     }
+    this.corelog.d(`rec: ${lid} ${blobs1.length} ${doubles1.length}`);
   }
 
   // d is a domain name like "x.y.z.tld"
@@ -443,25 +454,74 @@ export class LogPusher {
     );
   }
 
+  setupLogpushUrl() {
+    // https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/logs/retrieve
+    // start=2022-06-01T16:00:00Z
+    // end=2022-06-01T16:05:00Z
+    // bucket=cloudflare-logs
+    // prefix=http_requests/example.com/{DATE}
+    const accid = envutil.cfAccountId();
+    // ex: bucket/dir1/dir2
+    const logpath = envutil.logpushPath();
+    const p = logpath.indexOf("/");
+
+    if (util.emptyString(accid)) return null;
+    if (p < 0) return null;
+
+    const date = "{DATE}";
+    const now = new Date();
+    const end = now.toISOString();
+    now.setHours(now.getHours() - 3);
+    const start = now.toISOString();
+    // ex: bucket
+    const bucket = logpath.slice(0, p);
+    // ex: dir1/dir2
+    let rest = logpath.slice(p + 1);
+    if (!util.emptyString(rest)) {
+      rest = rest.endsWith("/") ? rest : `${rest}/`;
+    }
+    const prefix = rest ? `${rest}${date}` : `${date}`;
+
+    const u = new URL(
+      `https://api.cloudflare.com/client/v4/accounts/${accid}/logs/retrieve`
+    );
+    u.searchParams.set("bucket", bucket);
+    u.searchParams.set("prefix", prefix);
+    u.searchParams.set("start", start);
+    u.searchParams.set("end", end);
+
+    return u;
+  }
+
   // developers.cloudflare.com/analytics/analytics-engine/sql-reference
-  async count1(index, mins = 30, fields, limit = 10) {
-    const idx1 = this.idxmet(index, "1");
+  /**
+   * Return total count grouped by field
+   * @param {string} index
+   * @param {number} mins
+   * @param {string} fields
+   * @param {number} limit
+   * @returns {Promise<Response>}
+   */
+  async count1(lid, fields, mins = 30, dataset = ONE_WA_DATASET1, limit = 10) {
+    const idx1 = this.idxmet(lid, "1");
     const f0 = fields[0];
     const col = this.cols1.get(f0);
     const vol = this.cols1.get("req");
-    mins = util.bounds(mins, minmins, maxmins);
-    limit = util.bounds(limit, minlimit, maxlimit);
+    mins = util.bounds(mins || 30, minmins, maxmins);
+    dataset = dataset || ONE_WA_DATASET1;
+    limit = util.bounds(limit || 10, minlimit, maxlimit);
     const sql = `
       SELECT
         ${col} as ${f0},
         SUM(_sample_interval * ${vol}) as n
-      FROM ${idx1}
-      WHERE timestamp > NOW() - INTERVAL '${mins}' MINUTE
+      FROM ${dataset}
+      WHERE index1 = '${idx1}'
+        AND timestamp > NOW() - INTERVAL '${mins}' MINUTE
       GROUP BY ${f0}
       ORDER BY n DESC
       LIMIT ${limit}
       `;
-    return await this.query(sql);
+    return this.query(sql);
   }
 
   async query(sql) {
@@ -470,14 +530,97 @@ export class LogPusher {
     if (util.emptyString(sql)) return null;
 
     this.corelog.d(`querying: ${sql}`);
-    const res = await fetch(this.meturl, {
+    return await fetch(this.meturl, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.apitoken}`,
+        Authorization: `Bearer ${this.apitoken}`,
       },
       body: sql,
     });
-    return res.ok ? res.json() : null;
+  }
+
+  // developers.cloudflare.com/logs/r2-log-retrieval
+  /**
+   *
+   * @param {string} lid
+   * @param {string|Date|number} start
+   * @param {string|Date|number} end
+   * @returns {Promise<ReadableStream<String>> | Promise<ReadableStream<Uint8Array>> | Promise<null>}
+   */
+  async remotelogs(lid, start, end) {
+    const ak = envutil.logpushAccessKey();
+    const sk = envutil.logpushSecretKey();
+
+    if (this.remotelogurl == null) return null;
+    if (util.emptyString(this.apitoken)) return null;
+    if (util.emptyString(ak)) return null;
+    if (util.emptyString(sk)) return null;
+
+    // copy
+    const u = new URL(this.remotelogurl);
+    if (start && end) {
+      start = new Date(start);
+      end = new Date(end);
+      if (start.getTime() > end.getTime()) {
+        const t = start;
+        start = end;
+        end = t;
+      }
+      u.searchParams.set("start", start.toISOString());
+      u.searchParams.set("end", end.toISOString());
+    }
+
+    this.corelog.d(`remotelogs: ${u}`);
+
+    /*
+     * { "EventTimestampMs": 1672678731630,
+     *   "Outcome": "ok",
+     *   "Logs": [
+     *      { "Level": "log",
+     *        "Message": [
+     *           "k:lid,v:1,i:14.1.1.2,r:BOM,u:,q:c.rome.api,t:A,a:163.1.1.2|c.api.net,f:"
+     *        ],
+     *       "TimestampMs": 1672678731630
+     *      }
+     *   ],
+     *   "ScriptName": "dns-one"
+     * }
+     */
+    const r = await fetch(u, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${this.apitoken}`,
+        "R2-Access-Key-Id": ak,
+        "R2-Secret-Access-Key": sk,
+      },
+    });
+
+    if (r.ok) {
+      return this.filterlog(r.body, lid);
+    }
+
+    return r.body;
+  }
+
+  /**
+   *
+   * @param {ReadableStream<Uint8Array>|null} body
+   * @param {string} filterstr
+   * @returns {ReadableStream<String>|null}
+   */
+  filterlog(body, filterstr) {
+    if (body == null) return null;
+    if (processLogsAsText) {
+      return (
+        body
+          // note: DecompressionStream needs at least node 17
+          // gzip? pipeThrough(new DecompressionStream("gzip"))
+          .pipeThrough(new TextDecoderStream())
+          .pipeThrough(txs.strstream(filterstr))
+          .pipeThrough(new TextEncoderStream())
+      );
+    } else {
+      return body.pipeThrough(txs.bufstream(filterstr));
+    }
   }
 }

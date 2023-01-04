@@ -93,6 +93,21 @@ const defaults = new Map(
       type: "string",
       default: "",
     },
+    // set via secret, access-key with permissions to read logpush r2 bucket
+    CF_LOGPUSH_R2_ACCESS_KEY: {
+      type: "string",
+      default: "",
+    },
+    // set via secret, secret-key with permissions to read logpush r2 bucket
+    CF_LOGPUSH_R2_SECRET_KEY: {
+      type: "string",
+      default: "",
+    },
+    // r2 loc where logpush writes logs; ex: bucket-name/ or bucket-name/dir
+    CF_LOGPUSH_R2_PATH: {
+      type: "string",
+      default: "",
+    },
     // url to blocklist files: trie (td), rank-dir (rd), metadata: (filetag)
     CF_BLOCKLIST_URL: {
       type: "string",
@@ -174,7 +189,7 @@ const defaults = new Map(
     // avoid using the (slow) fetch polyfill if on nodejs
     NODE_AVOID_FETCH: {
       type: "boolean",
-      default: true,
+      default: false,
     },
     // use only doh upstream on nodejs (udp/tcp is the default on nodejs)
     NODE_DOH_ONLY: {
