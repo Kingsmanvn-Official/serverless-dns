@@ -35,6 +35,8 @@ let log = null;
 let noreqs = -1;
 let nofchecks = 0;
 const listeners = { connmap: [], servers: [] };
+// see also: dns-transport.js:ioTimeout
+const ioTimeoutMs = 50000; // 50 secs
 
 ((main) => {
   // listen for "go" and start the server
@@ -48,29 +50,31 @@ const listeners = { connmap: [], servers: [] };
 async function systemDown() {
   // system-down even may arrive even before the process has had the chance
   // to start, in which case globals like env and log may not be available
-  console.warn(noreqs, "rcv stop signal; uptime", uptime() / 1000, "secs");
+  console.warn(noreqs, "W rcv stop signal; uptime", uptime() / 1000, "secs");
 
   const srvs = listeners.servers;
   const cmap = listeners.connmap;
   listeners.servers = [];
   listeners.connmap = [];
 
+  console.warn("W after reqs:", noreqs, "closing", cmap.length, "servers");
   // drain all sockets stackoverflow.com/a/14636625
   // TODO: handle proxy protocol sockets
-  cmap.forEach((m) => {
-    if (!m) return;
-    console.warn("closing...", m.size, "connections");
+  for (const m of cmap) {
+    if (!m) continue;
+    console.warn("W closing...", m.size, "connections");
     for (const sock of m.values()) {
       close(sock);
     }
-  });
+  }
 
-  srvs.forEach((s) => {
-    if (!s) return;
+  for (const s of srvs) {
+    if (!s) continue;
     const saddr = s.address();
-    console.warn("stopping...", saddr);
+    console.warn("W stopping...", saddr);
     s.close(() => down(saddr));
-  });
+    s.unref();
+  }
 
   // in some cases, node stops listening but the process doesn't exit because
   // of other unreleased resources (see: svc.js#systemStop). ideally, fly.io
@@ -83,11 +87,13 @@ async function systemDown() {
   // fly.io init process should mop it up, regardless of what goes on in here.
   // FIXME rid of this delayed-exit once fly.io has health checks in place.
   // refs: community.fly.io/t/7341/6 and community.fly.io/t/7289
-  util.timeout(/* 2s*/ 2 * 1000, () => {
-    console.warn("game over");
-    // exit success aka 0; ref: community.fly.io/t/4547/6
-    process.exit(0);
-  });
+  envutil.onFly() &&
+    envutil.machinesTimeoutMillis() > 0 &&
+    util.timeout(/* 2s*/ 2 * 1000, () => {
+      console.warn("W game over");
+      // exit success aka 0; ref: community.fly.io/t/4547/6
+      process.exit(0);
+    });
 }
 
 function systemUp() {
@@ -133,6 +139,7 @@ function systemUp() {
       .listen(portdoh, () => up("DoH Cleartext", dohct.address()));
 
     const conns = trapServerEvents(dohct, dotct);
+    trapHttp2ServerEvents(dohct);
     listeners.connmap = [conns];
     listeners.servers = [dotct, dohct];
   } else {
@@ -167,6 +174,7 @@ function systemUp() {
 
     const conns1 = trapServerEvents(dot2);
     const conns2 = trapSecureServerEvents(dot1, doh);
+    trapHttp2ServerEvents(doh);
     listeners.connmap = [conns1, conns2];
     // may contain null elements
     listeners.servers = [dot1, dot2, doh];
@@ -193,23 +201,33 @@ function trapServerEvents(...servers) {
   servers &&
     servers.forEach((s) => {
       if (!s) return;
-      s.on("connection", (socket) => {
+      s.on("connection", (/** @type {net.Socket} */ socket) => {
         // use the network five tuple instead?
         const id = util.uid();
         conntrack.set(id, socket);
+        socket.setTimeout(ioTimeoutMs, () => {
+          log.d("tcp: incoming conn timed out; " + id);
+          socket.end();
+        });
 
         socket.on("error", (err) => {
-          log.e("tcp: incoming conn closed; " + err.message, err);
+          log.e("tcp: incoming conn closed with err; " + err.message);
           close(socket);
         });
 
-        socket.on("close", function () {
+        socket.on("close", (haderr) => {
           conntrack.delete(id);
+        });
+
+        socket.on("end", () => {
+          // TODO: is this needed? this is the default anyway
+          socket.end();
         });
       });
 
       s.on("error", (err) => {
-        log.e("tcp: server error; " + err.message, err);
+        log.e("tcp: stop! server error; " + err.message, err);
+        stopAfter(0);
       });
     });
 
@@ -231,24 +249,34 @@ function trapSecureServerEvents(...servers) {
         // use the network five tuple instead?
         const id = util.uid();
         conntrack.set(id, socket);
+        socket.setTimeout(ioTimeoutMs, () => {
+          log.w("tls: incoming conn timed out; " + id);
+          socket.end();
+        });
 
         // must be handled by Http2SecureServer, github.com/nodejs/node/issues/35824
         socket.on("error", (err) => {
-          log.e("tls: incoming conn closed; " + err.message, err);
+          log.e("tls: incoming conn closed; " + err.message);
           close(socket);
         });
 
-        socket.on("close", function () {
+        socket.on("close", (haderr) => {
           conntrack.delete(id);
+        });
+
+        socket.on("end", () => {
+          // TODO: is this needed? this is the default anyway
+          socket.end();
         });
       });
 
       s.on("error", (err) => {
-        log.e("tls: server error; " + err.message, err);
+        log.e("tls: stop! server error; " + err.message, err);
+        stopAfter(0);
       });
 
       s.on("tlsClientError", (err, tlsSocket) => {
-        log.e("tls: client err; " + err.message, err);
+        log.d("tls: client err; " + err.message);
         close(tlsSocket);
       });
     });
@@ -256,16 +284,64 @@ function trapSecureServerEvents(...servers) {
   return conntrack;
 }
 
+/**
+ * @param  {... import("http2").Http2Server} servers
+ */
+function trapHttp2ServerEvents(...servers) {
+  servers &&
+    servers.forEach((s) => {
+      if (!s) return;
+      s.on("stream", (stream, headers) => {
+        stream.on("error", (err) => {
+          log.e("http2: stream error; " + err.message);
+          if (!stream.destroyed) util.safeBox(() => stream.destroy());
+        });
+      });
+    });
+}
+
 function down(addr) {
-  console.warn(`closed: [${addr.address}]:${addr.port}`);
+  console.warn(`W closed: [${addr.address}]:${addr.port}`);
 }
 
 function up(server, addr) {
   log.i(server, `listening on: [${addr.address}]:${addr.port}`);
 }
 
+/**
+ * RST and/or closes tcp socket.
+ * @param {net.Socket} sock
+ */
 function close(sock) {
-  util.safeBox(() => sock.destroy());
+  sock &&
+    util.safeBox(() => {
+      sock.resetAndDestroy();
+      sock.unref();
+    });
+}
+
+/**
+ * @param {Http2ServerResponse} res
+ */
+function resClose(res) {
+  if (res && !res.destroy) util.safeBox(() => res.destroy());
+}
+
+/**
+ * @param {Http2ServerResponse} res
+ * @returns {Boolean}
+ */
+function resOkay(res) {
+  // determine if res is not destroyed, finished, and is writable
+  return res.writable;
+}
+
+/**
+ * @param {net.Socket} sock
+ * @returns {Boolean}
+ */
+function tcpOkay(sock) {
+  return sock.writable;
 }
 
 /**
@@ -276,6 +352,7 @@ function close(sock) {
  */
 function proxySockets(a, b) {
   if (a.destroyed || b.destroyed) return false;
+  // handle errors? stackoverflow.com/a/61091744
   a.pipe(b);
   b.pipe(a);
   return true;
@@ -467,9 +544,6 @@ function serveTLS(socket) {
   socket.on("data", (data) => {
     handleTCPData(socket, data, sb, host, flag);
   });
-  socket.on("end", () => {
-    socket.end();
-  });
 }
 
 /**
@@ -477,9 +551,7 @@ function serveTLS(socket) {
  * @param {Socket} socket
  */
 function serveTCP(socket) {
-  // TODO: TLS ClientHello is sent in proxy-proto v2, but fly.io
-  // doesn't yet support v2, but only v1. ClientHello would contain
-  // the SNI which we could then use here.
+  // TODO: TLS ClientHello is sent with proxy-proto v2
   const [flag, host] = ["", "ignored.example.com"];
   const sb = new ScratchBuffer();
 
@@ -488,9 +560,6 @@ function serveTCP(socket) {
 
   socket.on("data", (data) => {
     handleTCPData(socket, data, sb, host, flag);
-  });
-  socket.on("end", () => {
-    socket.end();
   });
 }
 
@@ -560,7 +629,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
  */
 async function handleTCPQuery(q, socket, host, flag) {
   let ok = true;
-  if (socket.destroyed) return;
+  if (bufutil.emptyBuf(q) || !tcpOkay(socket)) return;
 
   const rxid = util.xid();
   const t = log.startTime("handle-tcp-query-" + rxid);
@@ -574,7 +643,7 @@ async function handleTCPQuery(q, socket, host, flag) {
       const chunk = new Uint8Array([...rlBuf, ...r]);
 
       // writing to a destroyed socket crashes nodejs
-      if (!socket.destroyed) {
+      if (tcpOkay(socket)) {
         socket.write(chunk);
       } else {
         ok = false;
@@ -697,6 +766,10 @@ async function handleHTTPRequest(b, req, res) {
 
     log.lapTime(t, "upstream-end");
 
+    if (!resOkay(res)) {
+      throw new Error("res not writable");
+    }
+
     res.writeHead(fRes.status, util.copyHeaders(fRes));
 
     log.lapTime(t, "send-head");
@@ -707,15 +780,19 @@ async function handleHTTPRequest(b, req, res) {
 
     log.lapTime(t, "recv-ans");
 
-    if (!bufutil.emptyBuf(ans)) {
+    if (!resOkay(res)) {
+      throw new Error("res not writable");
+    } else if (!bufutil.emptyBuf(ans)) {
       res.end(bufutil.normalize8(ans));
     } else {
       // expect fRes.status to be set to non 2xx above
       res.end();
     }
   } catch (e) {
-    if (!res.headersSent) res.writeHead(400); // bad request
-    if (!res.writableEnded) res.end();
+    const ok = resOkay(res);
+    if (ok && !res.headersSent) res.writeHead(400); // bad request
+    if (ok && !res.writableEnded) res.end();
+    if (!ok) resClose(res);
     log.w(e);
   }
 
