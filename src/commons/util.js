@@ -135,6 +135,7 @@ export function timedOp(op, ms, cleanup = () => {}) {
         clearTimeout(tid);
 
         if (ex) {
+          cleanup(out);
           reject(ex);
         } else {
           resolve(out);
@@ -200,9 +201,9 @@ export function rolldice(sides = 6) {
 }
 
 // stackoverflow.com/a/8084248
-export function uid() {
+export function uid(prefix = "") {
   // ex: ".ww8ja208it"
-  return (Math.random() + 1).toString(36).slice(1);
+  return prefix + (Math.random() + 1).toString(36).slice(1);
 }
 
 export function xid() {
@@ -416,6 +417,12 @@ export function respond503() {
     status: 503, // unavailable
     headers: dohHeaders(),
   });
+}
+
+export function tkt48() {
+  const t = new Uint8Array(48);
+  crypto.getRandomValues(t);
+  return t;
 }
 
 export function logger(...tags) {

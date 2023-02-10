@@ -133,7 +133,7 @@ export class Transport {
     // the socket is not expected to have any error-listeners
     // so we add one to avoid unhandled errors
     sock.on("error", util.stub);
-    if (sock && !sock.destroyed) util.safeBox(() => sock.destroy());
+    if (sock && !sock.destroyed) util.safeBox(() => sock.destroySoon());
   }
 
   /**
@@ -143,6 +143,7 @@ export class Transport {
     // the socket is expected to not have any error-listeners
     // so we add one just in case to avoid unhandled errors
     sock.on("error", util.stub);
+    if (sock) util.safeBox(() => sock.disconnect());
     if (sock) util.safeBox(() => sock.close());
   }
 }
