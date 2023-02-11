@@ -46,7 +46,7 @@ const serverOpts = {
 };
 // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
 const tlsOpts = {
-  handshakeTimeout: Math.max((ioTimeoutMs / 3) | 0, 10000), // ms
+  handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 7000), // ms
   // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
   sessionTimeout: 60 * 60 * 12, // 12 hrs
 };
@@ -157,7 +157,6 @@ function systemUp() {
       .listen(portdoh, () => up("DoH Cleartext", dohct.address()));
 
     const conns = trapServerEvents(dohct, dotct);
-    trapHttp2ServerEvents(dohct);
     listeners.connmap = [conns];
     listeners.servers = [dotct, dohct];
   } else {
@@ -195,7 +194,6 @@ function systemUp() {
 
     const conns1 = trapServerEvents(dot2);
     const conns2 = trapSecureServerEvents(dot1, doh);
-    trapHttp2ServerEvents(doh);
     listeners.connmap = [conns1, conns2];
     // may contain null elements
     listeners.servers = [dot1, dot2, doh];
@@ -314,8 +312,9 @@ function trapSecureServerEvents(...servers) {
 
       s.on("close", () => clearInterval(rottm));
 
-      s.on("tlsClientError", (err, tlsSocket) => {
-        log.e("tls: client err; " + err.message);
+      s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
+        // todo: metrics
+        log.d("tls: client err; " + err.message);
         close(tlsSocket);
       });
     });
@@ -332,22 +331,6 @@ function rotateTkt(s) {
   s.setTicketKeys(util.tkt48());
 }
 
-/**
- * @param  {... import("http2").Http2Server} servers
- */
-function trapHttp2ServerEvents(...servers) {
-  servers &&
-    servers.forEach((s) => {
-      if (!s) return;
-      s.on("stream", (stream, headers) => {
-        stream.on("error", (err) => {
-          log.e("http2: stream error; " + err.message);
-          if (!stream.destroyed) util.safeBox(() => stream.destroy());
-        });
-      });
-    });
-}
-
 function down(addr) {
   console.warn(`W closed: [${addr.address}]:${addr.port}`);
 }
@@ -358,7 +341,7 @@ function up(server, addr) {
 
 /**
  * RST and/or closes tcp socket.
- * @param {net.Socket} sock
+ * @param {net.Socket | tls.TLSSocket} sock
  */
 function close(sock) {
   sock &&
@@ -782,31 +765,36 @@ async function serve200(req, res) {
  * @param {Http2ServerResponse} res
  */
 async function serveHTTPS(req, res) {
-  const ua = req.headers["user-agent"];
   trapRequestResponseEvents(req, res);
+  const ua = req.headers["user-agent"];
 
   const buffers = [];
 
   const t = log.startTime("recv-https");
 
-  for await (const chunk of req) {
-    buffers.push(chunk);
-  }
-  const b = bufutil.concatBuf(buffers);
-  const bLen = b.byteLength;
+  // if using for await loop, then it must be wrapped in a
+  // try-catch block: stackoverflow.com/questions/69169226
+  // if not, errors from reading req escapes unhandled.
+  // for example: req is being read from, but the underlying
+  // socket has been the closed (resulting in err_premature_close)
+  req.on("data", (chunk) => buffers.push(chunk));
 
-  log.endTime(t);
+  req.on("end", () => {
+    const b = bufutil.concatBuf(buffers);
+    const bLen = b.byteLength;
 
-  if (util.isPostRequest(req) && !dnsutil.validResponseSize(b)) {
-    res.writeHead(dnsutil.dohStatusCode(b), util.corsHeadersIfNeeded(ua));
-    res.end();
-    log.w(`HTTP req body length out of bounds: ${bLen}`);
-    return;
-  }
+    log.endTime(t);
 
-  machinesHeartbeat();
-  log.d("----> DoH request", req.method, bLen, req.url);
-  handleHTTPRequest(b, req, res);
+    if (util.isPostRequest(req) && !dnsutil.validResponseSize(b)) {
+      res.writeHead(dnsutil.dohStatusCode(b), util.corsHeadersIfNeeded(ua));
+      res.end();
+      log.w(`HTTP req body length out of bounds: ${bLen}`);
+    } else {
+      machinesHeartbeat();
+      log.d("----> DoH request", req.method, bLen, req.url);
+      handleHTTPRequest(b, req, res);
+    }
+  });
 }
 
 /**
@@ -880,13 +868,19 @@ async function handleHTTPRequest(b, req, res) {
  */
 function trapRequestResponseEvents(req, res) {
   // duplex streams end/finish difference: stackoverflow.com/a/34310963
-  const c1 = finished(res, (e) => {
-    if (e) log.w("h2: res fin w error", e);
-    c1();
+  finished(res, (e) => {
+    if (e) {
+      const reqstr = nodeutil.req2str(req);
+      const resstr = nodeutil.res2str(res);
+      log.w("h2: res fin w error", reqstr, resstr, e);
+    }
   });
-  const c2 = finished(req, (e) => {
-    if (e) log.w("h2: req fin w error", e);
-    c2();
+  finished(req, (e) => {
+    if (e) {
+      const reqstr = nodeutil.req2str(req);
+      const resstr = nodeutil.res2str(res);
+      log.w("h2: req fin w error", reqstr, resstr, e);
+    }
   });
 }
 
