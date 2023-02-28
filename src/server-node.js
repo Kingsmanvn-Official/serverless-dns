@@ -41,13 +41,14 @@ class Stats {
     this.noreqs = -1;
     this.nofchecks = 0;
     this.fasttls = 0;
+    this.totfasttls = 0;
     this.tlserr = 0;
   }
 
   str() {
     return (
       `noreqs=${this.noreqs} nofchecks=${this.nofchecks} ` +
-      `fasttls=${this.fasttls} tlserr=${this.tlserr}`
+      `fasttls=${this.fasttls}/${this.totfasttls} tlserr=${this.tlserr}`
     );
   }
 }
@@ -112,23 +113,10 @@ async function systemDown() {
   }
 
   // in some cases, node stops listening but the process doesn't exit because
-  // of other unreleased resources (see: svc.js#systemStop). ideally, fly.io
-  // health checks kick-in and apply a pre-defined restart policy, but as it
-  // stands, health checks are unimplemented for machines, and so we wait for
-  // a small amount of time, and force exit the process. the irony is, this
-  // timed wait here will keep up the node process for longer than necessary.
-  // in other cases where systemDown might be called due to interrupts such as
-  // SIGINT, there's already a pre-defined timeout (10s or so) after which
-  // fly.io init process should mop it up, regardless of what goes on in here.
-  // FIXME rid of this delayed-exit once fly.io has health checks in place.
-  // refs: community.fly.io/t/7341/6 and community.fly.io/t/7289
-  envutil.onFly() &&
-    envutil.machinesTimeoutMillis() > 0 &&
-    util.timeout(/* 2s*/ 2 * 1000, () => {
-      console.warn("W game over");
-      // exit success aka 0; ref: community.fly.io/t/4547/6
-      process.exit(0);
-    });
+  // of other unreleased resources (see: svc.js#systemStop); so exit
+  console.warn("W game over");
+  // exit success aka 0; ref: community.fly.io/t/4547/6
+  process.exit(0);
 }
 
 function systemUp() {
@@ -307,6 +295,7 @@ function trapSecureServerEvents(...servers) {
       });
 
       const rottm = setInterval(() => rotateTkt(s), 86400000); // 24 hours
+      rotm.unref();
 
       s.on("newSession", (id, data, next) => {
         const hid = bufutil.hex(id);
@@ -320,6 +309,7 @@ function trapSecureServerEvents(...servers) {
         const data = tlsSessions.get(hid) || null;
         if (data) log.d("tls: resume session; " + hid);
         if (data) stats.fasttls += 1;
+        else stats.totfasttls += 1;
         next(/* err*/ null, data);
       });
 
