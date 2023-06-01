@@ -10,6 +10,8 @@ import net, { isIPv6 } from "net";
 import tls, { Server } from "tls";
 import http2 from "http2";
 import * as h2c from "httpx-server";
+import * as os from "os";
+import v8 from "v8";
 import { V2ProxyProtocol } from "proxy-protocol-js";
 import * as system from "./system.js";
 import { handleRequest } from "./core/doh.js";
@@ -22,6 +24,7 @@ import * as util from "./commons/util.js";
 import "./core/node/config.js";
 import { finished } from "stream";
 import { LfuCache } from "@serverless-dns/lfu-cache";
+import * as memwatch from "@airbnb/node-memwatch";
 
 /**
  * @typedef {import("net").Socket} Socket
@@ -43,37 +46,29 @@ class Stats {
     this.fasttls = 0;
     this.totfasttls = 0;
     this.tlserr = 0;
+    // avg1, avg5, avg15, adj, maxconns
+    this.bp = [0, 0, 0, 0, 0];
   }
 
   str() {
     return (
       `noreqs=${this.noreqs} nofchecks=${this.nofchecks} ` +
+      `maxconns=${this.bp[4]}/adj=${this.bp[3]} ` +
+      `load=${this.bp[0]}%/${this.bp[1]}%/${this.bp[2]}% ` +
       `fasttls=${this.fasttls}/${this.totfasttls} tlserr=${this.tlserr}`
     );
   }
 }
 
-const stats = new Stats();
+// nodejs.org/api/net.html#serverlisten
+const zero6 = "::";
 const listeners = { connmap: [], servers: [] };
-// see also: dns-transport.js:ioTimeout
-const ioTimeoutMs = 50000; // 50 secs
-// nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
-const serverOpts = {
-  keepAlive: true,
-  noDelay: true,
-};
-// nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
-const tlsOpts = {
-  handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 7000), // ms
-  // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
-  sessionTimeout: 60 * 60 * 12, // 12 hrs
-};
-// nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
-const h2Opts = {
-  allowHTTP1: true,
-};
+const stats = new Stats();
+const tlsSessions = new LfuCache("tlsSessions", 10 * 1000); // ms
+const cpucount = os.cpus().length || 1;
+/** @type {memwatch.HeapDiff} */
+let heapdiff = null;
 
-const tlsSessions = new LfuCache("tlsSessions", 10000);
 ((main) => {
   // listen for "go" and start the server
   system.sub("go", systemUp);
@@ -94,6 +89,11 @@ async function systemDown() {
   listeners.connmap = [];
 
   console.warn("W", stats.str(), "; closing", cmap.length, "servers");
+
+  // 0 is ignored; github.com/nodejs/node/pull/48276
+  // accept only 1 conn (which keeps health-checks happy)
+  adjustMaxConns(1);
+
   // drain all sockets stackoverflow.com/a/14636625
   // TODO: handle proxy protocol sockets
   for (const m of cmap) {
@@ -104,8 +104,10 @@ async function systemDown() {
     }
   }
 
+  // stopping net.server only stops incoming reqs; it does not
+  // close open sockets: github.com/nodejs/node/issues/2642
   for (const s of srvs) {
-    if (!s) continue;
+    if (!s || !s.listening) continue;
     const saddr = s.address();
     console.warn("W stopping...", saddr);
     s.close(() => down(saddr));
@@ -126,6 +128,11 @@ function systemUp() {
   const downloadmode = envutil.blocklistDownloadOnly();
   const profilermode = envutil.profileDnsResolves();
   const tlsoffload = envutil.isCleartext();
+  const tcpbacklog = envutil.tcpBacklog();
+  const maxconns = envutil.maxconns();
+  // see also: dns-transport.js:ioTimeout
+  const ioTimeoutMs = envutil.ioTimeoutMs();
+  const measureHeap = envutil.measureHeap();
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
@@ -134,7 +141,25 @@ function systemUp() {
     const durationms = 60 * 1000;
     log.w("in profiler mode, run for", durationms, "and exit");
     stopAfter(durationms);
+  } else {
+    log.i(`bind ${zero6}, backlog ${tcpbacklog}, conns ${maxconns}`);
   }
+
+  // nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
+  const serverOpts = {
+    keepAlive: true,
+    noDelay: true,
+  };
+  // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
+  const tlsOpts = {
+    handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 7000), // ms
+    // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
+    sessionTimeout: 60 * 60 * 12, // 12 hrs
+  };
+  // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
+  const h2Opts = {
+    allowHTTP1: true,
+  };
 
   if (tlsoffload) {
     // fly.io terminated tls?
@@ -146,7 +171,9 @@ function systemUp() {
     const dotct = net
       // serveTCP must eventually call machines-heartbeat
       .createServer(serverOpts, serveTCP)
-      .listen(portdot, () => up("DoT Cleartext", dotct.address()));
+      .listen(portdot, zero6, tcpbacklog, () =>
+        up("DoT Cleartext", dotct.address())
+      );
 
     // DNS over HTTPS Cleartext
     // Same port for http1.1/h2 does not work on node without tls, that is,
@@ -159,7 +186,9 @@ function systemUp() {
     const dohct = h2c
       // serveHTTPS must eventually invoke machines-heartbeat
       .createServer(serverOpts, serveHTTPS)
-      .listen(portdoh, () => up("DoH Cleartext", dohct.address()));
+      .listen(portdoh, zero6, tcpbacklog, () =>
+        up("DoH Cleartext", dohct.address())
+      );
 
     const conns = trapServerEvents(dohct, dotct);
     listeners.connmap = [conns];
@@ -181,7 +210,7 @@ function systemUp() {
     const dot1 = tls
       // serveTLS must eventually invoke machines-heartbeat
       .createServer(secOpts, serveTLS)
-      .listen(portdot1, () => up("DoT", dot1.address()));
+      .listen(portdot1, zero6, tcpbacklog, () => up("DoT", dot1.address()));
 
     // DNS over TLS w ProxyProto
     const dot2 =
@@ -189,13 +218,15 @@ function systemUp() {
       net
         // serveDoTProxyProto must evenually invoke machines-heartbeat
         .createServer(serverOpts, serveDoTProxyProto)
-        .listen(portdot2, () => up("DoT ProxyProto", dot2.address()));
+        .listen(portdot2, zero6, tcpbacklog, () =>
+          up("DoT ProxyProto", dot2.address())
+        );
 
     // DNS over HTTPS
     const doh = http2
       // serveHTTPS must eventually invoke machines-heartbeat
       .createSecureServer({ ...secOpts, ...h2Opts }, serveHTTPS)
-      .listen(portdoh, () => up("DoH", doh.address()));
+      .listen(portdoh, zero6, tcpbacklog, () => up("DoH", doh.address()));
 
     const conns1 = trapServerEvents(dot2);
     const conns2 = trapSecureServerEvents(dot1, doh);
@@ -213,6 +244,8 @@ function systemUp() {
     listeners.servers.push(hcheck);
   }
 
+  if (measureHeap) heapdiff = new memwatch.HeapDiff();
+  adjustMaxConns();
   machinesHeartbeat();
 }
 
@@ -221,6 +254,8 @@ function systemUp() {
  * @returns {boolean}
  */
 function trapServerEvents(...servers) {
+  const ioTimeoutMs = envutil.ioTimeoutMs();
+
   const conntrack = new Map();
   servers &&
     servers.forEach((s) => {
@@ -263,6 +298,7 @@ function trapServerEvents(...servers) {
  * @returns {boolean}
  */
 function trapSecureServerEvents(...servers) {
+  const ioTimeoutMs = envutil.ioTimeoutMs();
   const conntrack = new Map();
 
   servers &&
@@ -910,11 +946,30 @@ function trapRequestResponseEvents(req, res) {
 }
 
 function machinesHeartbeat() {
+  const maxc = envutil.maxconns();
+  const minc = envutil.minconns();
+  const measureHeap = envutil.measureHeap();
+
   // increment no of requests
   stats.noreqs += 1;
-  if (stats.noreqs % 100 === 0) {
-    log.i(stats.str(), "in", uptime() / 60000, "mins");
+  // todo: adjust-max-conns every min?
+  if (stats.noreqs % (maxc / 2) === 0) {
+    adjustMaxConns();
   }
+
+  if (!measureHeap) {
+    endHeapDiff(heapdiff);
+    heapdiff = null;
+  } else if (heapdiff == null) {
+    heapdiff = new memwatch.HeapDiff();
+  } else if (stats.noreqs % (maxc * 10) === 0) {
+    endHeapDiff(heapdiff);
+    heapdiff = new memwatch.HeapDiff();
+  }
+  if (stats.noreqs % (minc * 2) === 0) {
+    log.i(stats.str(), "in", (uptime() / 60000) | 0, "mins");
+  }
+
   // nothing to do, if not on fly
   if (!envutil.onFly()) return;
   // if a fly machine app, figure out ttl
@@ -922,4 +977,71 @@ function machinesHeartbeat() {
   log.d("extend-machines-ttl by", t);
   if (t >= 0) stopAfter(t);
   // else: not on machines
+}
+
+function adjustMaxConns(n) {
+  const maxc = envutil.maxconns();
+  const minc = envutil.minconns();
+  let adj = (stats.bp[3] || 0) + 1;
+  // caveats:
+  // linux-magazine.com/content/download/62593/485442/version/1/file/Load_Average.pdf
+  // brendangregg.com/blog/2017-08-08/linux-load-averages.html
+  // linuxjournal.com/article/9001
+  let [avg1, avg5, avg15] = os.loadavg();
+  avg1 = (avg1 * 100) / cpucount;
+  avg5 = (avg5 * 100) / cpucount;
+  avg15 = (avg15 * 100) / cpucount;
+
+  if (n == null) {
+    // determine n based on load-avg
+    n = maxc;
+    if (avg1 > 95) {
+      n = minc;
+    } else if (avg1 > 90 || avg5 > 80 || avg15 > 75) {
+      n = Math.max((n * 0.1) | 0, minc);
+    } else if (avg1 > 80 || avg5 > 75 || avg15 > 70) {
+      n = Math.max((n * 0.25) | 0, minc);
+    } else if (avg1 > 75 || avg5 > 70 || avg15 > 65) {
+      n = Math.max((n * 0.4) | 0, minc);
+    } else {
+      // reset; n reverting back to maxconns
+      adj = 0;
+    }
+  } else {
+    // clamp n based on a preset
+    n = Math.min(maxc, n);
+    n = Math.max(minc, n);
+    // n adjusts as per client input, not load avg
+    adj = 0;
+  }
+
+  // nodejs.org/en/docs/guides/diagnostics/memory/using-gc-traces
+  if (adj > 0) {
+    v8.setFlagsFromString("--trace-gc");
+  } else {
+    v8.setFlagsFromString("--notrace-gc");
+  }
+
+  stats.bp = [avg1, avg5, avg15, adj, n];
+  const srvs = listeners.servers;
+  for (const s of srvs) {
+    if (!s || !s.listening) continue;
+    s.maxConnections = n;
+  }
+}
+
+/**
+ * @param {memwatch.HeapDiff} h
+ * @returns void
+ */
+function endHeapDiff(h) {
+  if (!h) return;
+  try {
+    const diff = h.end();
+    log.i("heap before", diff.before);
+    log.i("heap after", diff.after);
+    log.i("heap details", diff.change.details);
+  } catch (ex) {
+    log.w("heap-diff err", ex.message);
+  }
 }
