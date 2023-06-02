@@ -66,6 +66,8 @@ const listeners = { connmap: [], servers: [] };
 const stats = new Stats();
 const tlsSessions = new LfuCache("tlsSessions", 10 * 1000); // ms
 const cpucount = os.cpus().length || 1;
+const adjPeriodSec = 30;
+const adjTimer = util.timeout(adjPeriodSec * 1000, adjustMaxConns);
 /** @type {memwatch.HeapDiff} */
 let heapdiff = null;
 
@@ -88,8 +90,9 @@ async function systemDown() {
   listeners.servers = [];
   listeners.connmap = [];
 
-  console.warn("W", stats.str(), "; closing", cmap.length, "servers");
+  console.warn("W", stats.str(), "/ closing", cmap.length, "servers");
 
+  clearTimeout(adjTimer);
   // 0 is ignored; github.com/nodejs/node/pull/48276
   // accept only 1 conn (which keeps health-checks happy)
   adjustMaxConns(1);
@@ -152,9 +155,9 @@ function systemUp() {
   };
   // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
   const tlsOpts = {
-    handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 7000), // ms
+    handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 6 * 1000), // 6s in ms
     // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
-    sessionTimeout: 60 * 60 * 12, // 12 hrs
+    sessionTimeout: 60 * 60 * 12, // 12h in secs
   };
   // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
   const h2Opts = {
@@ -311,10 +314,11 @@ function trapSecureServerEvents(...servers) {
         conntrack.set(id, socket);
         socket.setTimeout(ioTimeoutMs, () => {
           log.d("tls: incoming conn timed out; " + id);
-          socket.end();
+          close(socket);
         });
 
-        // must be handled by Http2SecureServer, github.com/nodejs/node/issues/35824
+        // error must be handled by Http2SecureServer
+        // github.com/nodejs/node/issues/35824
         socket.on("error", (err) => {
           log.e("tls: incoming conn", id, "closed;", err.message);
           close(socket);
@@ -325,7 +329,8 @@ function trapSecureServerEvents(...servers) {
         });
 
         socket.on("end", () => {
-          // TODO: is this needed? this is the default anyway
+          // client gone, socket half-open at this point
+          // close this end of the socket, too
           socket.end();
         });
       });
@@ -388,19 +393,17 @@ function up(server, addr) {
  * @param {net.Socket | tls.TLSSocket} sock
  */
 function close(sock) {
-  sock &&
-    util.safeBox(() => {
-      if (sock.connecting) sock.resetAndDestroy();
-      else sock.destroySoon();
-      sock.unref();
-    });
+  if (!sock || sock.destroyed) return;
+  if (sock.connecting) sock.resetAndDestroy();
+  else sock.destroySoon();
+  sock.unref();
 }
 
 /**
  * @param {Http2ServerResponse} res
  */
 function resClose(res) {
-  if (res && !res.destroy) util.safeBox(() => res.destroy());
+  if (res && !res.destroy) res.destroy();
 }
 
 /**
@@ -851,8 +854,8 @@ async function serveHTTPS(req, res) {
       res.end();
       log.w(`HTTP req body length out of bounds: ${bLen}`);
     } else {
-      machinesHeartbeat();
       log.d("----> DoH request", req.method, bLen, req.url);
+      machinesHeartbeat();
       handleHTTPRequest(b, req, res);
     }
   });
@@ -952,10 +955,6 @@ function machinesHeartbeat() {
 
   // increment no of requests
   stats.noreqs += 1;
-  // todo: adjust-max-conns every min?
-  if (stats.noreqs % (maxc / 2) === 0) {
-    adjustMaxConns();
-  }
 
   if (!measureHeap) {
     endHeapDiff(heapdiff);
@@ -982,7 +981,6 @@ function machinesHeartbeat() {
 function adjustMaxConns(n) {
   const maxc = envutil.maxconns();
   const minc = envutil.minconns();
-  let adj = (stats.bp[3] || 0) + 1;
   // caveats:
   // linux-magazine.com/content/download/62593/485442/version/1/file/Load_Average.pdf
   // brendangregg.com/blog/2017-08-08/linux-load-averages.html
@@ -992,16 +990,19 @@ function adjustMaxConns(n) {
   avg5 = (avg5 * 100) / cpucount;
   avg15 = (avg15 * 100) / cpucount;
 
+  let adj = stats.bp[3] || 0;
+  // increase in load
+  if (avg1 > avg5) {
+    adj += 1;
+  }
   if (n == null) {
     // determine n based on load-avg
     n = maxc;
-    if (avg1 > 95) {
+    if (avg1 > 90) {
       n = minc;
-    } else if (avg1 > 90 || avg5 > 80 || avg15 > 75) {
-      n = Math.max((n * 0.1) | 0, minc);
-    } else if (avg1 > 80 || avg5 > 75 || avg15 > 70) {
-      n = Math.max((n * 0.25) | 0, minc);
-    } else if (avg1 > 75 || avg5 > 70 || avg15 > 65) {
+    } else if (avg1 > 80 || avg5 > 80) {
+      n = Math.max((n * 0.2) | 0, minc);
+    } else if (avg1 > 70 || avg5 > 70) {
       n = Math.max((n * 0.4) | 0, minc);
     } else {
       // reset; n reverting back to maxconns
@@ -1013,6 +1014,18 @@ function adjustMaxConns(n) {
     n = Math.max(minc, n);
     // n adjusts as per client input, not load avg
     adj = 0;
+  }
+
+  // adjustMaxConns is called every adjPeriodSec
+  const count15minutes = 15 * (60 / adjPeriodSec);
+  const count10minutes = 10 * (60 / adjPeriodSec);
+  if (adj > count15minutes) {
+    log.w("load: stopping; n:", n, "adjs:", adj, "avgs:", avg1, avg5, avg15);
+    stopAfter(0);
+    return;
+  } else if (adj > count10minutes) {
+    n = (minc / 2) | 0;
+    log.w("load: persistent; n:", n, "adjs:", adj, "avgs:", avg1, avg5, avg15);
   }
 
   // nodejs.org/en/docs/guides/diagnostics/memory/using-gc-traces
