@@ -68,8 +68,8 @@ const listeners = { connmap: [], servers: [] };
 const stats = new Stats();
 const tlsSessions = new LfuCache("tlsSessions", 10000);
 const cpucount = os.cpus().length || 1;
-const adjPeriodSec = 15;
-const adjTimer = util.repeat(adjPeriodSec * 1000, adjustMaxConns);
+const adjPeriodSec = 5;
+let adjTimer = null;
 /** @type {memwatch.HeapDiff} */
 let heapdiff = null;
 
@@ -95,7 +95,7 @@ async function systemDown() {
 
   console.warn("W", stats.str(), "/ closing", cmap.length, "conn maps");
 
-  clearTimeout(adjTimer);
+  if (adjTimer) clearTimeout(adjTimer);
   // 0 is ignored; github.com/nodejs/node/pull/48276
   // accept only 1 conn (which keeps health-checks happy)
   adjustMaxConns(1);
@@ -148,6 +148,7 @@ function systemUp() {
     log.w("in profiler mode, run for", durationms, "and exit");
     stopAfter(durationms);
   } else {
+    adjTimer = util.repeat(adjPeriodSec * 1000, adjustMaxConns);
     log.i(`cpu ${cpucount}, ip ${zero6}, tcpb ${tcpbacklog}, c ${maxconns}`);
   }
 
@@ -1002,12 +1003,14 @@ function adjustMaxConns(n) {
   if (n == null) {
     // determine n based on load-avg
     n = maxc;
-    if (avg1 > 90) {
+    if (avg1 > 100) {
       n = minc;
-    } else if (avg1 > 80 || avg5 > 80) {
+    } else if (avg1 > 90 || avg5 > 80) {
       n = Math.max((n * 0.2) | 0, minc);
-    } else if (avg1 > 70 || avg5 > 70) {
+    } else if (avg1 > 80 || avg5 > 75) {
       n = Math.max((n * 0.4) | 0, minc);
+    } else if (avg1 > 70) {
+      n = Math.max((n * 0.6) | 0, minc);
     } else {
       // reset; n reverting back to maxconns
       adj = 0;
