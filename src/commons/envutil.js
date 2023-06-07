@@ -169,13 +169,13 @@ export function tlsKeyPath() {
 }
 
 export function tlsCrt() {
-  if (!envManager) return "";
-  return envManager.get("TLS_CRT") || "";
+  if (!envManager) return null;
+  return envManager.get("TLS_CRT") || null;
 }
 
 export function tlsKey() {
-  if (!envManager) return "";
-  return envManager.get("TLS_KEY") || "";
+  if (!envManager) return null;
+  return envManager.get("TLS_KEY") || null;
 }
 
 export function cacheTtl() {
@@ -218,9 +218,15 @@ export function minconns() {
 }
 
 export function ioTimeoutMs() {
-  if (!envManager) return 15 * 1000;
+  if (!envManager) return 7 * 1000;
 
-  return envManager.get("IO_TIMEOUT_MS") || 15 * 1000;
+  return envManager.get("IO_TIMEOUT_MS") || 7 * 1000;
+}
+
+export function shutdownTimeoutMs() {
+  if (!envManager) return 60 * 1000;
+
+  return envManager.get("SHUTDOWN_TIMEOUT_MS") || 60 * 1000;
 }
 
 export function measureHeap() {
@@ -279,6 +285,19 @@ export function profileDnsResolves() {
   if (!envManager) return false;
 
   return envManager.get("PROFILE_DNS_RESOLVES") || false;
+}
+
+export function imageRef() {
+  if (!envManager) return "";
+  if (!onFly()) return "";
+
+  return envManager.get("FLY_IMAGE_REF") || "";
+}
+
+export function secretb64() {
+  if (!envManager) return null;
+
+  return envManager.get("TOP_SECRET_512_B64") || null;
 }
 
 export function accessKeys() {
