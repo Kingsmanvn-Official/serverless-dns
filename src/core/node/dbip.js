@@ -18,7 +18,11 @@ const geo6name = "dbip.v6";
 
 /** @param {LogPusher} lp */
 export async function setup(lp) {
-  if (!lp || !envutil.hasDisk()) return false;
+  if (!lp) return false;
+  // in download only mode, logpush enable/disable is ignored
+  if (!envutil.logpushEnabled() && !envutil.blocklistDownloadOnly()) {
+    return false;
+  }
 
   const url = envutil.geoipUrl();
   const timestamp = timestampFromUrl(url);
@@ -91,8 +95,9 @@ function setupLocally(lp, timestamp) {
 }
 
 function hasDbipFiles(timestamp) {
-  const [g4, g6] = getFilePaths(timestamp);
+  if (!envutil.hasDisk()) return false;
 
+  const [g4, g6] = getFilePaths(timestamp);
   return fs.existsSync(g4) && fs.existsSync(g6);
 }
 
